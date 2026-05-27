@@ -1,14 +1,73 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local TextChatService = game:GetService("TextChatService")
+
+local LocalPlayer = Players.LocalPlayer
 
 -- Load LiteUI
 local LiteUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/NicelyTinned/lite-ui/refs/heads/main/src/init.luau"))()
 
-local trackedMeshes = {}
+-- Global Master Tracker for all players' physics meshes
+local ALL_TRACKED_MESHES = {} 
 local renderConnection = nil
 
--- Custom Accessory Welder
+-- Global state for your current equipped skin
+_G.CurrentSkinId = 123826306477155 
+
+-- ==========================================
+-- 1. NETWORK & ENCODING SYSTEM
+-- ==========================================
+local PREFIX_REQUEST   = "TehEpikDuckIsComing" 
+local PREFIX_BROADCAST = "BuilderManMan"       
+
+local WORD_POOL = {
+    [0]="apple", [1]="banana", [2]="cherry", [3]="dog", [4]="cat", [5]="house", [6]="tree", [7]="river",
+    [8]="ocean", [9]="cloud", [10]="sun", [11]="moon", [12]="star", [13]="rock", [14]="grass", [15]="bird",
+    [16]="fish", [17]="book", [18]="pen", [19]="chair", [20]="table", [21]="door", [22]="window", [23]="shirt",
+    [24]="pants", [25]="shoe", [26]="hat", [27]="glove", [28]="paper", [29]="clock", [30]="coin", [31]="key",
+    [32]="lamp", [33]="box", [34]="ring", [35]="cup"
+}
+
+local WORD_LOOKUP = {}
+for i, word in pairs(WORD_POOL) do WORD_LOOKUP[word] = i end
+local function toCamel(word) return string.gsub(word, "^%l", string.upper) end
+
+local function EncodeUserId(num)
+    num = tonumber(num) or 0
+    if num == 0 then return toCamel(WORD_POOL[0]) end
+    local result = ""
+    while num > 0 do
+        local remainder = num % 36
+        result = toCamel(WORD_POOL[remainder]) .. result
+        num = math.floor(num / 36)
+    end
+    return result
+end
+
+local function DecodeUserId(camelStr)
+    if not camelStr or camelStr == "" then return nil end
+    local num = 0
+    for word in string.gmatch(camelStr, "%u%l*") do
+        local lowerWord = string.lower(word)
+        local val = WORD_LOOKUP[lowerWord]
+        if not val then return nil end
+        num = num * 36 + val
+    end
+    return num
+end
+
+local function BroadcastSkinId(targetSkinId)
+    local payload = PREFIX_BROADCAST .. EncodeUserId(targetSkinId)
+    local generalChannel = TextChatService.TextChannels:FindFirstChild("RBXGeneral")
+    if generalChannel then
+        generalChannel:SendAsync(payload)
+    end
+end
+
+-- ==========================================
+-- 2. AVATAR LOADING & PHYSICS LOOP
+-- ==========================================
 local function weldCustomAccessory(character, accessory)
     local handle = accessory:FindFirstChild("Handle")
     if not handle then return end
@@ -19,9 +78,7 @@ local function weldCustomAccessory(character, accessory)
     local charAtt = character:FindFirstChild(accAtt.Name, true)
     if not charAtt then return end
 
-    -- Ensure handle is unanchored to move with the character
     handle.Anchored = false
-
     local weld = Instance.new("Weld")
     weld.Name = "AccessoryWeld"
     weld.Part0 = charAtt.Parent
@@ -33,35 +90,33 @@ local function weldCustomAccessory(character, accessory)
     accessory.Parent = character
 end
 
--- Dynamic Avatar Loader
-local function loadPlayerAvatar(userId)
-    local character = Players.LocalPlayer.Character
+-- UPDATED: Now takes character as a parameter
+local function loadPlayerAvatar(userId, character)
     if not character then return end
 
-    -- Clean up previous custom skin, accessories, clothing, and body colors
+    -- Clean up previous items
     for _, obj in pairs(character:GetChildren()) do
-        if obj.Name:match("^CustomMesh_") or 
-           obj:IsA("Accessory") or 
-           obj:IsA("Shirt") or 
-           obj:IsA("Pants") or 
-           obj:IsA("BodyColors") then
+        if obj.Name:match("^CustomMesh_") or obj:IsA("Accessory") or obj:IsA("Shirt") or obj:IsA("Pants") or obj:IsA("BodyColors") then
             obj:Destroy()
         end
     end
-    trackedMeshes = {}
+    
+    -- Safely clear ONLY this specific player's tracked meshes
+    if ALL_TRACKED_MESHES[character] then
+        for _, entry in ipairs(ALL_TRACKED_MESHES[character]) do
+            if entry.CustomPart then entry.CustomPart:Destroy() end
+        end
+    end
+    ALL_TRACKED_MESHES[character] = {}
 
     -- Fetch Avatar Data
     local success, appearanceModel = pcall(function()
         return Players:GetCharacterAppearanceAsync(userId)
     end)
-    
     if not success or not appearanceModel then return end
 
-    local shirtTemplate = nil
-    local pantsTemplate = nil
-    local bodyColors = nil
+    local shirtTemplate, pantsTemplate, bodyColors = nil, nil, nil
 
-    -- Extract, Clone, and Import to Character
     for _, item in pairs(appearanceModel:GetChildren()) do
         if item:IsA("Shirt") then
             shirtTemplate = item.ShirtTemplate
@@ -77,42 +132,26 @@ local function loadPlayerAvatar(userId)
         end
     end
 
-    -- Setup Visibility (Exclude Accessory parts so they stay visible)
     for _, obj in character:GetDescendants() do
         if obj:IsA("BasePart") and obj.Name ~= "HumanoidRootPart" and not obj.Parent:IsA("Accessory") then
-            if obj.Name:match("Arm") or obj.Name == "Head" then
-                obj.Transparency = 0
-            else
-                obj.Transparency = 1
-            end
+            obj.Transparency = (obj.Name:match("Arm") or obj.Name == "Head") and 0 or 1
         elseif obj:IsA("Decal") and obj.Parent.Name ~= "Head" and not obj.Parent:IsA("Accessory") then
             obj.Transparency = 1
         end
     end
 
-    -- Construct Dynamic MESH_DATA mapping
     local DYNAMIC_MESH_DATA = {
-        -- First 2 non-rotational (Texture: Shirt)
         {BodyPart = "Torso", MeshId = "123826306477155", TextureId = shirtTemplate, Size = 1.01, Opacity = 0.02, Position = Vector3.zero, Rotation = Vector3.new(0, -90, 0)},
         {BodyPart = "Torso", MeshId = "123826306477155", TextureId = shirtTemplate, Size = 0.95, Opacity = 1, Position = Vector3.zero, Rotation = Vector3.new(0, -90, 0)},
-        
-        -- First 2 rotational (Texture: Pants)
         {BodyPart = "Torso", MeshId = "114977119770915", TextureId = pantsTemplate, Size = 0.8, Opacity = 1, Position = Vector3.new(0.5, -1, -0.4), Rotation = Vector3.new(0, 180, 0), RotationalDrag = {MaxDownAngle = 20, MaxUpAngle = 20, Pivot = CFrame.new(0, -1, -0.5) * CFrame.Angles(0,math.rad(180),0), Strength = 0.2, Damp = 0.7}},
         {BodyPart = "Torso", MeshId = "102005630554650", TextureId = pantsTemplate, Size = 0.8, Opacity = 1, Position = Vector3.new(-0.5, -1, -0.4), Rotation = Vector3.new(0, 180, 0), RotationalDrag = {MaxDownAngle = 20, MaxUpAngle = 20, Pivot = CFrame.new(0, -1, -0.5) * CFrame.Angles(0,math.rad(180),0), Strength = 0.2, Damp = 0.7}},
-        
-        -- Last rotational (Texture: Shirt)
         {BodyPart = "Torso", MeshId = "7606070501", TextureId = shirtTemplate, Size = 1.15, Opacity = 1, Position = Vector3.new(0, 0.2, 0.75), Rotation = Vector3.new(0, -90, 0), RotationalDrag = {MaxDownAngle = 25, MaxUpAngle = 80, Pivot = CFrame.new(0, 1, -0.5), Strength = 0.2, Damp = 0.45}},
-        
-        -- Legs (Texture: Pants)
         {BodyPart = "Right Leg", MeshId = "71665474693582", TextureId = pantsTemplate, Size = 1, Opacity = 1, Position = Vector3.new(0.05, 0, 0), Rotation = Vector3.new(0, 180, 0)},
         {BodyPart = "Left Leg", MeshId = "107817600592761", TextureId = pantsTemplate, Size = 1, Opacity = 1, Position = Vector3.new(-0.05, 0, 0), Rotation = Vector3.new(0, 180, 0)}
     }
 
-    local R15_MAP = {
-        ["Torso"] = "UpperTorso", ["Left Leg"] = "LeftUpperLeg", ["Right Leg"] = "RightUpperLeg"
-    }
+    local R15_MAP = {["Torso"] = "UpperTorso", ["Left Leg"] = "LeftUpperLeg", ["Right Leg"] = "RightUpperLeg"}
 
-    -- Apply MeshParts with SurfaceAppearance
     for _, data in ipairs(DYNAMIC_MESH_DATA) do
         local targetPart = character:FindFirstChild(data.BodyPart) or character:FindFirstChild(R15_MAP[data.BodyPart])
         if not targetPart then continue end
@@ -124,137 +163,145 @@ local function loadPlayerAvatar(userId)
         customPart.CanQuery = false
         customPart.Massless = true
         customPart.Anchored = true
-        if bodyColors then customPart.Color = bodyColors[data.BodyPart:gsub("%s", "") .. "Color3"] end
+        
+        if bodyColors then 
+            pcall(function() customPart.Color = bodyColors[data.BodyPart:gsub("%s", "") .. "Color3"] end)
+        end
+        
         customPart.Transparency = 1 - (data.Opacity or 1)
         
-        -- MeshId assignment is usually restricted, but executors bypass this.
-        -- Wrapped in a pcall to prevent the loop from breaking if the executor throws.
         pcall(function()
             customPart.MeshId = "rbxassetid://" .. data.MeshId
-            
             if data.TextureId then
                 local surfaceApp = Instance.new("SurfaceAppearance")
                 surfaceApp.ColorMap = data.TextureId
-                surfaceApp.AlphaMode = Enum.AlphaMode.Overlay -- Eliminates the black background
+                surfaceApp.AlphaMode = Enum.AlphaMode.Overlay
                 surfaceApp.Parent = customPart
             end
         end)
         
         customPart.Size = Vector3.new(data.Size, data.Size, data.Size)
-
         local offsetCFrame = CFrame.new(data.Position.X, data.Position.Y, -data.Position.Z) * CFrame.Angles(math.rad(data.Rotation.X), math.rad(data.Rotation.Y), math.rad(data.Rotation.Z))
         customPart.CFrame = targetPart.CFrame * offsetCFrame
         customPart.Parent = character
 
         local entry = { CustomPart = customPart, TargetPart = targetPart, Offset = offsetCFrame, RotationalDrag = data.RotationalDrag }
-        
         if data.RotationalDrag then
             entry.CurrentAngleX = 0
             entry.AngularVelocity = 0
             entry.LastPosition = targetPart.Position
         end
         
-        table.insert(trackedMeshes, entry)
+        table.insert(ALL_TRACKED_MESHES[character], entry)
     end
 end
 
--- Render Loop Hook
+-- Render Loop Hook: Now iterates through ALL characters currently tracked
 if renderConnection then renderConnection:Disconnect() end
 
 renderConnection = RunService.PreRender:Connect(function(dt)
-    for i = #trackedMeshes, 1, -1 do
-        local data = trackedMeshes[i]
-        
-        if not (data.TargetPart and data.TargetPart.Parent and data.CustomPart and data.CustomPart.Parent) then
-            if data.CustomPart then data.CustomPart:Destroy() end
-            table.remove(trackedMeshes, i)
+    for character, trackedMeshes in pairs(ALL_TRACKED_MESHES) do
+        -- Clean up memory if a player leaves or respawns
+        if not character or not character.Parent then
+            ALL_TRACKED_MESHES[character] = nil
             continue
         end
 
-        local targetCFrame = data.TargetPart.CFrame * data.Offset
-
-        if data.RotationalDrag then
-            local dragParams = data.RotationalDrag
-            local targetAngleX = 0
+        for i = #trackedMeshes, 1, -1 do
+            local data = trackedMeshes[i]
             
-            local currentPosition = data.TargetPart.Position
-            local worldVelocity = (currentPosition - data.LastPosition) / dt
-            data.LastPosition = currentPosition 
-            
-            local localVel = data.TargetPart.CFrame:VectorToObjectSpace(worldVelocity)
-            local dragForce = (localVel.Z * 2.5) - (localVel.Y * 1.5)
-            
-            if dragForce < 0 then
-                targetAngleX = math.max(dragForce, -dragParams.MaxDownAngle)
-            else
-                targetAngleX = math.min(dragForce, dragParams.MaxUpAngle)
+            if not (data.TargetPart and data.TargetPart.Parent and data.CustomPart and data.CustomPart.Parent) then
+                if data.CustomPart then data.CustomPart:Destroy() end
+                table.remove(trackedMeshes, i)
+                continue
             end
 
-            local stiffness = (dragParams.Strength or 0.2) * 800
-            local damping = (dragParams.Damp or 0.78) * 15
-            
-            local displacement = data.CurrentAngleX - targetAngleX
-            local springAcceleration = (-stiffness * displacement) - (damping * data.AngularVelocity)
-            
-            data.AngularVelocity = data.AngularVelocity + (springAcceleration * dt)
-            data.CurrentAngleX = data.CurrentAngleX + (data.AngularVelocity * dt)
-            
-            if data.CurrentAngleX < 0 then
-                data.CurrentAngleX = math.max(data.CurrentAngleX, -dragParams.MaxDownAngle)
-            else
-                data.CurrentAngleX = math.min(data.CurrentAngleX, dragParams.MaxUpAngle)
-            end
+            local targetCFrame = data.TargetPart.CFrame * data.Offset
 
-            local pivotCFrame = data.TargetPart.CFrame * dragParams.Pivot
-            local originalCFrame = data.TargetPart.CFrame * data.Offset
-            local offsetFromPivot = pivotCFrame:Inverse() * originalCFrame
-            local rotationCFrame = CFrame.Angles(math.rad(data.CurrentAngleX), 0, 0)
-            
-            data.CustomPart.CFrame = pivotCFrame * rotationCFrame * offsetFromPivot
-        else
-            data.CustomPart.CFrame = targetCFrame
+            if data.RotationalDrag then
+                local dragParams = data.RotationalDrag
+                local targetAngleX = 0
+                
+                local currentPosition = data.TargetPart.Position
+                local worldVelocity = (currentPosition - data.LastPosition) / dt
+                data.LastPosition = currentPosition 
+                
+                local localVel = data.TargetPart.CFrame:VectorToObjectSpace(worldVelocity)
+                local dragForce = (localVel.Z * 2.5) - (localVel.Y * 1.5)
+                
+                if dragForce < 0 then
+                    targetAngleX = math.max(dragForce, -dragParams.MaxDownAngle)
+                else
+                    targetAngleX = math.min(dragForce, dragParams.MaxUpAngle)
+                end
+
+                local stiffness = (dragParams.Strength or 0.2) * 800
+                local damping = (dragParams.Damp or 0.78) * 15
+                
+                local displacement = data.CurrentAngleX - targetAngleX
+                local springAcceleration = (-stiffness * displacement) - (damping * data.AngularVelocity)
+                
+                data.AngularVelocity = data.AngularVelocity + (springAcceleration * dt)
+                data.CurrentAngleX = data.CurrentAngleX + (data.AngularVelocity * dt)
+                
+                if data.CurrentAngleX < 0 then
+                    data.CurrentAngleX = math.max(data.CurrentAngleX, -dragParams.MaxDownAngle)
+                else
+                    data.CurrentAngleX = math.min(data.CurrentAngleX, dragParams.MaxUpAngle)
+                end
+
+                local pivotCFrame = data.TargetPart.CFrame * dragParams.Pivot
+                local originalCFrame = data.TargetPart.CFrame * data.Offset
+                local offsetFromPivot = pivotCFrame:Inverse() * originalCFrame
+                local rotationCFrame = CFrame.Angles(math.rad(data.CurrentAngleX), 0, 0)
+                
+                data.CustomPart.CFrame = pivotCFrame * rotationCFrame * offsetFromPivot
+            else
+                data.CustomPart.CFrame = targetCFrame
+            end
         end
     end
 end)
 
--- Multi-Platform UI Dragging Logic
-local function initializeDrag(frame)
-    local dragging, dragInput, dragStart, startPos
+-- ==========================================
+-- 3. NETWORK LISTENER SETUP
+-- ==========================================
+TextChatService.OnIncomingMessage = function(message)
+    local overrideProperties = Instance.new("TextChatMessageProperties")
+    local msgText = message.Text
+    local sender = message.TextSource and Players:GetPlayerByUserId(message.TextSource.UserId)
+    
+    if sender == LocalPlayer then return end
 
-    frame.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = frame.Position
-
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
+    if msgText == PREFIX_REQUEST then
+        if sender and _G.CurrentSkinId then
+            task.spawn(function()
+                task.wait(math.random(10, 30) / 10) 
+                BroadcastSkinId(_G.CurrentSkinId)
             end)
         end
-    end)
+        overrideProperties.Text = ""
+        return overrideProperties
+    end
 
-    frame.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            dragInput = input
+    if string.sub(msgText, 1, #PREFIX_BROADCAST) == PREFIX_BROADCAST then
+        local camelPayload = string.sub(msgText, #PREFIX_BROADCAST + 1)
+        local decodedSkinId = DecodeUserId(camelPayload)
+        
+        -- UPDATED: Now successfully calls the function!
+        if decodedSkinId and sender and sender.Character then
+            loadPlayerAvatar(decodedSkinId, sender.Character)
+            print("[Hub Network] Loaded Skin ID " .. tostring(decodedSkinId) .. " for player " .. sender.Name)
         end
-    end)
-
-    UserInputService.InputChanged:Connect(function(input)
-        if input == dragInput and dragging then
-            local delta = input.Position - dragStart
-            frame.Position = UDim2.new(
-                startPos.X.Scale, 
-                startPos.X.Offset + delta.X, 
-                startPos.Y.Scale, 
-                startPos.Y.Offset + delta.Y
-            )
-        end
-    end)
+        
+        overrideProperties.Text = ""
+        return overrideProperties
+    end
 end
 
--- UI Construction
+-- ==========================================
+-- 4. UI CONSTRUCTION (Moved to bottom so it can call network functions)
+-- ==========================================
 local isMinimized = false
 local defaultSize = UDim2.new(0.9, 0, 0, 160)
 local minSize = UDim2.new(0, 45, 0, 45)
@@ -274,7 +321,6 @@ local ScreenGui = LiteUI.new("ScreenGui", {
                 UICorner = {"UICorner", {CornerRadius = UDim.new(0, 8)}},
                 UISizeConstraint = {"UISizeConstraint", {MaxSize = Vector2.new(350, 160)}},
                 
-                -- Header & Minimize Button
                 Header = {"Frame", {
                     Size = UDim2.new(1, 0, 0, 45),
                     BackgroundTransparency = 1,
@@ -321,7 +367,6 @@ local ScreenGui = LiteUI.new("ScreenGui", {
                     }
                 }},
                 
-                -- Main Content area
                 Content = {"Frame", {
                     Size = UDim2.new(1, 0, 1, -45),
                     Position = UDim2.new(0, 0, 0, 45),
@@ -365,7 +410,12 @@ local ScreenGui = LiteUI.new("ScreenGui", {
                                         
                                         if nameSuccess and targetId then
                                             self.Instance.Text = "Loading Assets..."
-                                            loadPlayerAvatar(targetId)
+                                            
+                                            -- UPDATED: Load locally, update global state, broadcast to network!
+                                            loadPlayerAvatar(targetId, LocalPlayer.Character)
+                                            _G.CurrentSkinId = targetId
+                                            BroadcastSkinId(targetId)
+                                            
                                             self.Instance.Text = "Load Skin"
                                         else
                                             self.Instance.Text = "User Not Found"
@@ -387,6 +437,51 @@ local ScreenGui = LiteUI.new("ScreenGui", {
     }
 })
 
--- Initialize dragging on CoreGui tree instantiation
+-- UI Dragging initialization
+local function initializeDrag(frame)
+    local dragging, dragInput, dragStart, startPos
+
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    frame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale, 
+                startPos.X.Offset + delta.X, 
+                startPos.Y.Scale, 
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
 local targetMainFrame = game.CoreGui:WaitForChild("AstralAvatarHub"):WaitForChild("MainFrame")
 initializeDrag(targetMainFrame)
+
+-- Trigger initial network sync
+local function RequestAllActiveSkins()
+    local generalChannel = TextChatService.TextChannels:FindFirstChild("RBXGeneral")
+    if generalChannel then
+        generalChannel:SendAsync(PREFIX_REQUEST)
+    end
+end
+task.spawn(RequestAllActiveSkins)
